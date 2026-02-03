@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./data:/app/data
+    environment:
+      TZ: America/Chicago
+    restart: unless-stopped
