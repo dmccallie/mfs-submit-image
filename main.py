@@ -7,7 +7,12 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import sqlite3
-from iptcinfo3 import IPTCInfo
+
+# NOTE - make sure a local executable of exiftool is available!
+# use the script in this repo to download and place it in the project root if needed
+# or have Dockerfile pull and bundle it in the image
+from exiftool import ExifToolHelper
+
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import FileResponse, RedirectResponse
@@ -85,6 +90,107 @@ def clip_text(value: str | None, limit: int = 40) -> str:
         return text
     return f"{text[:limit - 3]}..."
 
+def embed_photo_metadata_with_xmp( 
+    image_path: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    creator: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    circa_date_created: Optional[str] = None,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+    country: Optional[str] = None,
+    credit: Optional[str] = None,
+    source: Optional[str] = None,
+):
+    """
+    Embed archival metadata into a JPEG using XMP fields.
+
+    Parameters
+    ----------
+    image_path : str
+        Path to the JPEG image.
+
+    title : str
+        Title of the image.
+        Shows in Photoshop as Basic: "Title" 
+
+    description : str
+        Caption or description.
+        Shows in Photoshop as Basic: "Description"
+
+    creator : str
+        Photographer or archive creator.
+        Shows in Photoshop Basic: "Author"
+        Shows in PS IPTC as "Creator"
+
+    keywords : list[str]
+        Searchable keywords.
+        Shows in Photoshop Basic: "Keywords"
+
+    circa_date_created : str
+        Historical or estimated date of photo (as text).
+        Does not appear in Photoshop's XMP viewer so we shouldn't rely on it.
+        Maybe store this info in the Description field by convention?
+
+    city/state/country : str
+        Location metadata.
+        Shows in PS IPTC and PS Origin as "City", "State/Province", and "Country"
+
+    credit : str
+        Archive credit line.
+        Shows in PS Origin and IPTC as "Credit Line"
+
+    source : str
+        Provenance or submission source.
+        Shows in PS Origin and IPTC as "Source"
+    """
+
+    tags = {}
+
+    if title:
+        tags["XMP-dc:Title"] = title
+        # old IIM model that some support - ObjectName
+        tags['XMP-iptc:ObjectName'] = title
+
+    if description:
+        tags["XMP-dc:Description"] = description
+
+    if creator:
+        tags["XMP-dc:Creator"] = creator
+
+    if keywords:
+        tags["XMP-dc:Subject"] = keywords
+
+    if circa_date_created:
+        # CircaDateCreated doesn't show in PS XMP viewer but some apps can see it
+        tags["XMP-iptcExt:CircaDateCreated"] = circa_date_created
+
+    if city:
+        tags["XMP-photoshop:City"] = city
+
+    if state:
+        tags["XMP-photoshop:State"] = state
+
+    if country:
+        tags["XMP-photoshop:Country"] = country
+
+    if credit:
+        tags["XMP-photoshop:Credit"] = credit
+
+    if source:
+        tags["XMP-photoshop:Source"] = source
+        tags["XMP-iptcCore:Source"] = source
+
+    if not tags:
+        return
+
+    with ExifToolHelper() as et:
+        et.set_tags(
+            image_path,
+            tags,
+            params=["-overwrite_original"],
+        )
 
 def write_image_file(
     filename: str,
@@ -92,6 +198,7 @@ def write_image_file(
     title: str | None,
     description: str | None,
     submitted_by: str | None,
+    approximate_date: str | None,
 ) -> Path:
     suffix = Path(filename or "upload").suffix
     stored_name = f"{uuid4().hex}{suffix}"
@@ -101,14 +208,22 @@ def write_image_file(
         fh.flush()
         os.fsync(fh.fileno())
 
-    info = IPTCInfo(str(image_path), force=True)
-    if title:
-        info["object name"] = title
-    if description:
-        info["caption/abstract"] = description
-    if submitted_by:
-        info["source"] = submitted_by
-    info.save_as(str(image_path), {"overwrite": True})
+    embed_photo_metadata_with_xmp(
+        image_path=str(image_path),
+        title=title,
+        description=description,
+        circa_date_created=approximate_date,
+        # creator=submitted_by,
+        source=submitted_by,
+    )
+    # info = IPTCInfo(str(image_path), force=True)
+    # if title:
+    #     info["object name"] = title
+    # if description:
+    #     info["caption/abstract"] = description
+    # if submitted_by:
+    #     info["source"] = submitted_by
+    # info.save_as(str(image_path), {"overwrite": True})
     return image_path
 
 
@@ -120,7 +235,7 @@ def save_submission(
     submitted_by: str | None,
     approximate_date: str | None,
 ) -> None:
-    image_path = write_image_file(filename, filebuffer, title, description, submitted_by)
+    image_path = write_image_file(filename, filebuffer, title, description, submitted_by, approximate_date)
 
     created_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
@@ -157,16 +272,26 @@ def update_submission(
     image_path = Path(row["image_path"])
     new_image_path = None
     if photo_filename and photo_buffer:
-        new_image_path = write_image_file(photo_filename, photo_buffer, title, description, submitted_by)
+        # also saves XMP
+        new_image_path = write_image_file(photo_filename, photo_buffer, title, description, submitted_by, approximate_date)
+    
     elif image_path.exists():
-        info = IPTCInfo(str(image_path), force=True)
-        if title is not None:
-            info["object name"] = title
-        if description is not None:
-            info["caption/abstract"] = description
-        if submitted_by is not None:
-            info["source"] = submitted_by
-        info.save_as(str(image_path), {"overwrite": True})
+        embed_photo_metadata_with_xmp(
+            image_path=str(image_path),
+            title=title,
+            description=description,
+            # creator=submitted_by,
+            source=submitted_by,
+            circa_date_created=approximate_date,
+        )
+        # info = IPTCInfo(str(image_path), force=True)
+        # if title is not None:
+        #     info["object name"] = title
+        # if description is not None:
+        #     info["caption/abstract"] = description
+        # if submitted_by is not None:
+        #     info["source"] = submitted_by
+        # info.save_as(str(image_path), {"overwrite": True})
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -294,9 +419,9 @@ def submissions_table(rows: list[sqlite3.Row]):
                     Tr(
                         Th("Submitted"),
                         Th("Title"),
-                        Th("Description"),
+                        Th("Description (be sure to include approx date)"),
                         Th("Submitted By"),
-                        Th("Approximate Date"),
+                        # Th("Approximate Date"),
                     )
                 ),
                 Tbody(
@@ -306,7 +431,7 @@ def submissions_table(rows: list[sqlite3.Row]):
                             Td(clip_text(row["title"])),
                             Td(clip_text(row["description"])),
                             Td(row["submitted_by"]),
-                            Td(row["approximate_date"]),
+                            # Td(row["approximate_date"]),
                             hx_get=form_partial.to(image_id=row["id"]),
                             hx_target="#form-panel",
                             hx_swap="outerHTML",
@@ -369,15 +494,15 @@ def form_panel(
                 ),
                 id="dropzone",
             ),
-            Label("Title", Input(name="title", type="text", value=(edit_row["title"] if edit_row else ""))),
+            Label("Title (e.g. a brief caption to go under the image)", Input(name="title", type="text", value=(edit_row["title"] if edit_row else ""))),
             Label(
-                "Description",
+                "Description (people, context, and an approximate date of the image)",
                 Textarea(edit_row["description"] if edit_row else "", name="description", rows=8),
             ),
-            Label(
-                "Approximate date",
-                Input(name="approximate_date", type="text", value=(edit_row["approximate_date"] if edit_row else "")),
-            ),
+            # Label(
+            #     "Approximate date",
+            #     Input(name="approximate_date", type="text", value=(edit_row["approximate_date"] if edit_row else "")),
+            # ),
             Label(
                 "Submitted by",
                 Input(name="submitted_by", type="text", value=(edit_row["submitted_by"] if edit_row else "")),

@@ -5,6 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "iptcinfo3>=2.3.0",
+    "pyexiftool>=0.5.6",
     "python-fasthtml>=0.12.39",
 ]
