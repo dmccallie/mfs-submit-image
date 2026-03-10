@@ -20,7 +20,7 @@ from exiftool import ExifToolHelper
 
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
-from starlette.responses import FileResponse, RedirectResponse
+from starlette.responses import RedirectResponse, JSONResponse
 
 from fasthtml.common import *
 
@@ -79,12 +79,25 @@ def s3_client():
     return boto3.client("s3")
 
 
+def sanitize_s3_metadata_value(value: str | None) -> str:
+    if value is None:
+        return ""
+    # S3 user metadata is transmitted in HTTP headers, so CR/LF must be escaped.
+    return value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n").strip()
+
+
+def decode_escaped_newlines(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.replace("\\r\\n", "\r\n").replace("\\n", "\n").replace("\\r", "\r")
+
+
 def upload_file_to_s3(local_path: Path, s3_key: str, title: str | None, description: str | None, submitted_by: str | None) -> None:
     content_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
     metadata = {
-        "submitted_by": normalize_submitter_name(submitted_by) or "",
-        "title": title or "",
-        "description": description or "",
+        "submitted_by": sanitize_s3_metadata_value(normalize_submitter_name(submitted_by) or ""),
+        "title": sanitize_s3_metadata_value(title),
+        "description": sanitize_s3_metadata_value(description),
     }
     s3_client().upload_file(
         str(local_path),
@@ -178,6 +191,13 @@ def clip_text(value: str | None, limit: int = 40) -> str:
         return text
     return f"{text[:limit - 3]}..."
 
+
+def encode_exiftool_newlines(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # ExifToolHelper expects escaped newline characters in text fields.
+    return value.replace("\r\n", "\\r\\n").replace("\r", "\\r").replace("\n", "\\n")
+
 def embed_photo_metadata_with_xmp( 
     image_path: str,
     title: Optional[str] = None,
@@ -237,13 +257,16 @@ def embed_photo_metadata_with_xmp(
 
     tags = {}
 
-    if title:
-        tags["XMP-dc:Title"] = title
-        # old IIM model that some support - ObjectName
-        tags['XMP-iptc:ObjectName'] = title
+    encoded_title = encode_exiftool_newlines(title)
+    encoded_description = encode_exiftool_newlines(description)
 
-    if description:
-        tags["XMP-dc:Description"] = description
+    if encoded_title:
+        tags["XMP-dc:Title"] = encoded_title
+        # old IIM model that some support - ObjectName
+        tags['XMP-iptc:ObjectName'] = encoded_title
+
+    if encoded_description:
+        tags["XMP-dc:Description"] = encoded_description
 
     if creator:
         tags["XMP-dc:Creator"] = creator
@@ -316,6 +339,63 @@ def upload_submission_image(
             local_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _coerce_exif_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            text = _coerce_exif_value(item)
+            if text:
+                return text
+        return ""
+    if isinstance(value, dict):
+        preferred = ["lang-default", "x-default", "en-US", "en"]
+        for key in preferred:
+            text = _coerce_exif_value(value.get(key))
+            if text:
+                return text
+        for item in value.values():
+            text = _coerce_exif_value(item)
+            if text:
+                return text
+        return ""
+    return str(value).strip()
+
+
+def extract_xmp_form_fields(image_path: Path) -> dict[str, str]:
+    with ExifToolHelper() as et:
+        metadata_list = et.get_metadata(str(image_path))
+        # print("Raw metadata extracted from image:", metadata_list)
+    metadata = metadata_list[0] if metadata_list else {}
+
+    title_dc = _coerce_exif_value(metadata.get("XMP-dc:Title"))
+    title_iptc = _coerce_exif_value(metadata.get("XMP-iptc:ObjectName"))
+    title_xmp = _coerce_exif_value(metadata.get("XMP:Title"))
+    title = decode_escaped_newlines(title_dc or title_iptc or title_xmp)
+
+    description_dc = _coerce_exif_value(metadata.get("XMP-dc:Description"))
+    description_iptc = _coerce_exif_value(metadata.get("XMP-iptc:Caption-Abstract"))
+    description_xmp = _coerce_exif_value(metadata.get("XMP:Description"))
+    description = decode_escaped_newlines(description_dc or description_iptc or description_xmp)
+
+    source_iptc = _coerce_exif_value(metadata.get("XMP-iptcCore:Source"))
+    source_photoshop = _coerce_exif_value(metadata.get("XMP-photoshop:Source"))
+    source_xmp = _coerce_exif_value(metadata.get("XMP:Source"))
+    source = decode_escaped_newlines(source_iptc or source_photoshop or source_xmp)
+
+    # IPTC Core Source takes precedence when both are present.
+    source = source_iptc or source_photoshop
+    normalized_source = normalize_submitter_name(source)
+
+    return {
+        "title": title,
+        "description": description,
+        "submitted_by": normalized_source,
+    }
 
 def save_submission(
     filename: str,
@@ -540,7 +620,58 @@ def table_panel(rows: list[sqlite3.Row], *, oob: bool = False):
     attrs = {"id": "table-panel"}
     if oob:
         attrs["hx-swap-oob"] = "true"
-    return Div(submissions_table(rows), **attrs)
+    return Div(
+        submissions_table(rows),
+        Div(
+            Button(
+                "Rebuild Database",
+                type="button",
+                hx_post=rebuild_db,
+                hx_target="#table-panel",
+                hx_swap="outerHTML",
+                style="margin-top: 1rem;"
+            ),
+            style="display: flex; justify-content: flex-end;"
+        ),
+        **attrs
+    )
+@rt("/rebuild-db")
+async def rebuild_db(request: Request):
+    # Scan S3 bucket and repopulate DB
+    s3 = s3_client()
+    objects = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET_NAME):
+        for obj in page.get("Contents", []):
+            objects.append(obj["Key"])
+
+    rows = []
+    for key in objects:
+        try:
+            head = s3.head_object(Bucket=S3_BUCKET_NAME, Key=key)
+            meta = head.get("Metadata", {})
+            submitted_by = decode_escaped_newlines(meta.get("submitted_by", ""))
+            title = decode_escaped_newlines(meta.get("title", ""))
+            description = decode_escaped_newlines(meta.get("description", ""))
+            created_at = head.get("LastModified")
+            if created_at:
+                created_at = created_at.astimezone(timezone.utc).isoformat()
+            else:
+                created_at = datetime.now(timezone.utc).isoformat()
+            rows.append((key, title, description, submitted_by, created_at))
+        except Exception as e:
+            continue
+
+    # Clear and repopulate DB
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM submissions")
+        conn.executemany(
+            "INSERT INTO submissions (image_path, title, description, submitted_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            rows
+        )
+
+    # Return updated table
+    return table_panel(db_rows(), oob=True)
 
 
 @rt
@@ -584,6 +715,27 @@ def form_partial(image_id: int | None = None):
 @rt("/partials/table")
 def table_partial():
     return table_panel(db_rows())
+
+
+@rt("/extract-metadata")
+async def extract_metadata(photo: UploadFile):
+    filebuffer = await photo.read()
+    await photo.close()
+    if not filebuffer:
+        return JSONResponse({"title": "", "description": "", "submitted_by": ""})
+
+    temp_path = temp_file_from_bytes(filebuffer, photo.filename or "upload")
+    try:
+        payload = extract_xmp_form_fields(temp_path)
+        print("Extracted metadata from uploaded image:", payload)
+    except Exception:
+        payload = {"title": "", "description": "", "submitted_by": ""}
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return JSONResponse(payload)
 
 
 @rt
