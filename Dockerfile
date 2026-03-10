@@ -6,7 +6,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir iptcinfo3 python-fasthtml
+RUN pip install --no-cache-dir boto3 pyexiftool python-dotenv iptcinfo3 python-fasthtml
 
 COPY main.py /app/main.py
 

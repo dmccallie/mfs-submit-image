@@ -1,0 +1,37 @@
+#dropzone {
+  border: 2px dashed var(--pico-muted-border-color);
+  border-radius: 10px;
+  padding: 1rem;
+  text-align: center;
+  background: var(--pico-card-background-color);
+}
+
+#dropzone.dragover {
+  border-color: var(--pico-primary);
+  background: var(--pico-muted-border-color);
+}
+
+#preview {
+  max-width: 100%;
+  max-height: 360px;
+  margin-top: 1rem;
+  display: none;
+}
+
+#photo {
+  display: none;
+}
+
+.table-wrap {
+  max-height: 320px;
+  overflow-y: auto;
+  margin-top: 2rem;
+}
+
+table {
+  width: 100%;
+}
+
+#title-label {
+  margin-top: 1rem;
+}
