@@ -16,3 +16,9 @@ wheels/
 .env.staging
 .env.development
 .env.test
+
+# images and db
+*.jpg
+*.jpeg
+*.png
+*.db
