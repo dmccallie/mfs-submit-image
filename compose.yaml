@@ -1,0 +1,23 @@
+name: mfs-submit-image
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mfs-submit-image-app
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      TZ: America/Chicago
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      # boto3 standard region variables, sourced from your existing key when needed.
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-${AWS_S3_REGION_NAME:-us-east-1}}
+      AWS_REGION: ${AWS_REGION:-${AWS_S3_REGION_NAME:-us-east-1}}
+    restart: unless-stopped
