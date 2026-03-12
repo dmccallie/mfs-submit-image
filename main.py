@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hmac
 import mimetypes
 import os
 from pathlib import Path
 import random
 import re
 import tempfile
+from urllib.parse import quote, urlencode
+from typing import Optional, List
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -19,6 +22,8 @@ from dotenv import load_dotenv
 from exiftool import ExifToolHelper
 
 from starlette.datastructures import UploadFile
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 from starlette.responses import RedirectResponse, JSONResponse
 
@@ -33,6 +38,22 @@ SUBMITTER_NAMES = ["DPM", "JBM", "ALM", "EMC", "KRM", "HHM", "SJMIII", "THMIII",
 S3_BUCKET_NAME = "mfs-photo-submissions"  # store images in S3
 
 load_dotenv(dotenv_path=Path(".env"))
+
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+APP_SESSION_SECRET = os.getenv("APP_SESSION_SECRET", "dev-insecure-session-secret-change-me")
+APP_SESSION_MAX_AGE = int(os.getenv("APP_SESSION_MAX_AGE", "2592000"))  # 30 days
+# set this to 0 for local testing, set to 1 when behind HTTPS in production to protect cookies from being sent over insecure connections
+APP_SECURE_COOKIES = os.getenv("APP_SECURE_COOKIES", "0") == "1"
+
+SORTABLE_COLUMNS = {
+    "id": "id",
+    "submitted_by": "submitted_by",
+    "title": "title",
+    "description": "description",
+    "created_at": "created_at",
+}
+DEFAULT_SORT_BY = "id"
+DEFAULT_SORT_DIR = "desc"
 
 
 def normalize_submitter_name(value: str | None) -> str:
@@ -145,14 +166,29 @@ def init_db() -> None:
         )
 
 
-def db_rows() -> list[sqlite3.Row]:
+def normalize_sort(sort_by: str | None, sort_dir: str | None) -> tuple[str, str]:
+    normalized_by = sort_by if sort_by in SORTABLE_COLUMNS else DEFAULT_SORT_BY
+    normalized_dir = "asc" if sort_dir == "asc" else "desc"
+    return normalized_by, normalized_dir
+
+
+def build_index_url(sort_by: str, sort_dir: str, image_id: int | None = None) -> str:
+    params: dict[str, str] = {"sort_by": sort_by, "sort_dir": sort_dir}
+    if image_id is not None:
+        params["image_id"] = str(image_id)
+    return f"/?{urlencode(params)}"
+
+
+def db_rows(sort_by: str = DEFAULT_SORT_BY, sort_dir: str = DEFAULT_SORT_DIR) -> list[sqlite3.Row]:
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
+    sort_expr = SORTABLE_COLUMNS[safe_sort_by]
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        """
+        f"""
         SELECT id, image_path, title, description, submitted_by, created_at
         FROM submissions
-        ORDER BY id DESC
+        ORDER BY {sort_expr} {safe_sort_dir.upper()}, id DESC
         """
     ).fetchall()
     conn.close()
@@ -488,17 +524,131 @@ app, rt = fast_app(
         )
 )
 
-def submissions_table(rows: list[sqlite3.Row]):
+
+def _build_login_redirect_target(request: Request) -> str:
+    target = request.url.path
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    return quote(target, safe="/?=&")
+
+
+class RequireLoginMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not APP_PASSWORD: #if no password is set, disable authentication requirement
+            return await call_next(request)
+
+        path = request.url.path
+        if path == "/login" or path.startswith("/static/"): # allow these
+            return await call_next(request)
+
+        if request.session.get("authenticated"): # allow if already authenticated
+            return await call_next(request)
+
+        login_url = f"/login?next={_build_login_redirect_target(request)}"
+        if "hx-request" in request.headers:
+            response = JSONResponse({"detail": "authentication required"}, status_code=401)
+            response.headers["HX-Redirect"] = login_url
+            return response
+        return RedirectResponse(url=login_url, status_code=303)
+
+
+app.add_middleware(RequireLoginMiddleware)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=APP_SESSION_SECRET,
+    max_age=APP_SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=APP_SECURE_COOKIES,
+)
+
+
+def login_panel(error: str | None = None, next_url: str = "/"):
+    return Titled(
+        APP_TITLE,
+        Div(
+            H2("Sign In"),
+            P("Enter the shared password to access the archive submission app."),
+            P(error, style="color: #b42318; font-weight: 600;") if error else "",
+            Form(method="post", action="/login")(
+                Label(
+                    "Password",
+                    Input(type="password", name="password", autocomplete="current-password", required=True),
+                ),
+                Input(type="hidden", name="next", value=next_url or "/"),
+                Div(
+                    Button("Sign in", type="submit"),
+                    style="margin-top: 0.75rem;",
+                ),
+            ),
+            cls="container",
+            style="max-width: 560px;",
+        ),
+    )
+
+
+@rt("/login")
+async def login(
+    request: Request,
+    password: str | None = None,
+    next: str | None = "/",
+):
+    if not APP_PASSWORD:
+        return RedirectResponse(url="/", status_code=303)
+
+    next_url = next or "/"
+    if not next_url.startswith("/"):
+        next_url = "/"
+
+    if request.method == "GET":
+        if request.session.get("authenticated"):
+            return RedirectResponse(url=next_url, status_code=303)
+        return login_panel(next_url=next_url)
+
+    if password and hmac.compare_digest(password, APP_PASSWORD):
+        request.session["authenticated"] = True
+        return RedirectResponse(url=next_url, status_code=303)
+
+    return login_panel(error="Incorrect password.", next_url=next_url)
+
+
+@rt("/logout")
+def logout(request: Request):
+    request.session.clear()
+    if "hx-request" in request.headers:
+        response = JSONResponse({"detail": "logged out"}, status_code=200)
+        response.headers["HX-Redirect"] = "/login"
+        return response
+    return RedirectResponse(url="/login", status_code=303)
+
+def submissions_table(rows: list[sqlite3.Row], sort_by: str, sort_dir: str):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
+
+    def sortable_header(label: str, key: str, width: str | None = None):
+        next_dir = "desc" if (safe_sort_by == key and safe_sort_dir == "asc") else "asc"
+        indicator = ""
+        if safe_sort_by == key:
+            indicator = " ▲" if safe_sort_dir == "asc" else " ▼"
+        attrs = {
+            "hx_get": table_partial.to(sort_by=key, sort_dir=next_dir),
+            "hx_target": "#table-panel",
+            "hx_swap": "outerHTML",
+            "hx_push_url": build_index_url(key, next_dir),
+            "style": "cursor: pointer; user-select: none;",
+        }
+        if width:
+            attrs["width"] = width
+        return Th(f"{label}{indicator}", **attrs)
+
     return Div(
         H2("Previous submissions"),
         Div(
             Table(
                 Thead(
                     Tr(
-                        Th("Submitted By", width="10%"),
-                        Th("Title"),
-                        Th("Description"),
-                        Th("Date Submitted", width="15%"),
+                        sortable_header("Submitted By", "submitted_by", width="10%"),
+                        sortable_header("Title", "title"),
+                        sortable_header("Description", "description"),
+                        sortable_header("Date Submitted", "created_at", width="15%"),
                         # Th("Approximate Date"),
                     )
                 ),
@@ -510,10 +660,10 @@ def submissions_table(rows: list[sqlite3.Row]):
                             Td(clip_text(row["description"])),
                             Td(format_submitted_time(row["created_at"])),
                             # Td(row["approximate_date"]),
-                            hx_get=form_partial.to(image_id=row["id"]),
+                            hx_get=form_partial.to(image_id=row["id"], sort_by=safe_sort_by, sort_dir=safe_sort_dir),
                             hx_target="#form-panel",
                             hx_swap="outerHTML",
-                            hx_push_url=f"/?image_id={row['id']}",
+                            hx_push_url=build_index_url(safe_sort_by, safe_sort_dir, image_id=row["id"]),
                             style="cursor: pointer;",
                         )
                         for row in rows
@@ -536,9 +686,12 @@ def form_panel(
     edit_row: sqlite3.Row | None,
     image_src: str,
     image_exists: bool,
+    sort_by: str,
+    sort_dir: str,
     *,
     oob: bool = False,
 ):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
     is_edit = edit_row is not None
     selected_submitter = normalize_submitter_name(edit_row["submitted_by"] if edit_row else "")
     attrs = {"id": "form-panel"}
@@ -546,6 +699,7 @@ def form_panel(
         attrs["hx-swap-oob"] = "true"
 
     form = Form(
+        id="submission-form",
         method="post",
         action=update if is_edit else submit,
         enctype="multipart/form-data",
@@ -573,7 +727,7 @@ def form_panel(
                 id="dropzone",
             ),
             Label(
-                "Title (A SHORT meaningful identifier for the image, e.g THM Golden Wedding)",
+                "Title (A SHORT meaningful name for the image, e.g THM Golden Wedding Anniversary)",
                    Input(name="title", type="text", value=(edit_row["title"] if edit_row else "")),
                    id="title-label",),
             Label(
@@ -599,15 +753,26 @@ def form_panel(
             Button(
                 "Cancel",
                 type="button",
-                hx_get=form_partial.to(),
+                hx_get=form_partial.to(sort_by=safe_sort_by, sort_dir=safe_sort_dir),
                 hx_target="#form-panel",
                 hx_swap="outerHTML",
-                hx_push_url="/",
+                hx_push_url=build_index_url(safe_sort_by, safe_sort_dir),
             )
             if is_edit
             else "",
+            Button(
+                "Log out",
+                id="logout-button",
+                type="submit",
+                formaction="/logout",
+                formmethod="post",
+                hx_post=logout,
+                hx_swap="none",
+            ) if APP_PASSWORD else "",
             style="display: flex; gap: 0.75rem; align-items: center;",
         ),
+        Input(type="hidden", name="sort_by", value=safe_sort_by),
+        Input(type="hidden", name="sort_dir", value=safe_sort_dir),
     )
 
     missing_notice = (
@@ -616,17 +781,20 @@ def form_panel(
     return Div(form, notice_panel(missing_notice), **attrs)
 
 
-def table_panel(rows: list[sqlite3.Row], *, oob: bool = False):
+def table_panel(rows: list[sqlite3.Row], sort_by: str, sort_dir: str, *, oob: bool = False):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
     attrs = {"id": "table-panel"}
     if oob:
         attrs["hx-swap-oob"] = "true"
     return Div(
-        submissions_table(rows),
+        submissions_table(rows, safe_sort_by, safe_sort_dir),
         Div(
             Button(
                 "Rebuild Database",
                 type="button",
                 hx_post=rebuild_db,
+                hx_vals=f'{{"sort_by":"{safe_sort_by}","sort_dir":"{safe_sort_dir}"}}',
+                hx_confirm="Are you sure you want to rebuild the database? This will clear and repopulate all submission rows.",
                 hx_target="#table-panel",
                 hx_swap="outerHTML",
                 style="margin-top: 1rem;"
@@ -636,7 +804,12 @@ def table_panel(rows: list[sqlite3.Row], *, oob: bool = False):
         **attrs
     )
 @rt("/rebuild-db")
-async def rebuild_db(request: Request):
+async def rebuild_db(
+    request: Request,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
+):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
     # Scan S3 bucket and repopulate DB
     s3 = s3_client()
     objects = []
@@ -671,12 +844,17 @@ async def rebuild_db(request: Request):
         )
 
     # Return updated table
-    return table_panel(db_rows(), oob=True)
+    return table_panel(db_rows(safe_sort_by, safe_sort_dir), safe_sort_by, safe_sort_dir, oob=True)
 
 
 @rt
-def index(image_id: int | None = None):
-    rows = db_rows()
+def index(
+    image_id: int | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
+):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
+    rows = db_rows(safe_sort_by, safe_sort_dir)
     edit_row = db_row_by_id(image_id) if image_id else None
     image_exists = False
     image_src = ""
@@ -687,8 +865,8 @@ def index(image_id: int | None = None):
     return Titled(
         APP_TITLE,
         Div(
-            form_panel(edit_row, image_src, image_exists),
-            table_panel(rows),
+            form_panel(edit_row, image_src, image_exists, safe_sort_by, safe_sort_dir),
+            table_panel(rows, safe_sort_by, safe_sort_dir),
             cls="container",
             hx_boost="true",
         ),
@@ -701,7 +879,12 @@ def edit(image_id: int):
 
 
 @rt("/partials/form")
-def form_partial(image_id: int | None = None):
+def form_partial(
+    image_id: int | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
+):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
     edit_row = db_row_by_id(image_id) if image_id else None
     image_exists = False
     image_src = ""
@@ -709,12 +892,13 @@ def form_partial(image_id: int | None = None):
         image_exists = bool(edit_row["image_path"])
         if image_exists:
             image_src = image_by_id.to(image_id=edit_row["id"], v=edit_row["image_path"])
-    return form_panel(edit_row, image_src, image_exists)
+    return form_panel(edit_row, image_src, image_exists, safe_sort_by, safe_sort_dir)
 
 
 @rt("/partials/table")
-def table_partial():
-    return table_panel(db_rows())
+def table_partial(sort_by: str | None = None, sort_dir: str | None = None):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
+    return table_panel(db_rows(safe_sort_by, safe_sort_dir), safe_sort_by, safe_sort_dir)
 
 
 @rt("/extract-metadata")
@@ -745,16 +929,19 @@ async def submit(
     title: str | None = None,
     description: str | None = None,
     submitted_by: str | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
 ):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
     filebuffer = await photo.read()
     await photo.close()
     submitted_by = normalize_submitter_name(submitted_by)
     save_submission(photo.filename or "upload", filebuffer, title, description, submitted_by)
     if "hx-request" not in request.headers:
-        return RedirectResponse(url="/", status_code=303)
+        return RedirectResponse(url=build_index_url(safe_sort_by, safe_sort_dir), status_code=303)
     return Div(
-        form_panel(None, "", False, oob=True),
-        table_panel(db_rows(), oob=True),
+        form_panel(None, "", False, safe_sort_by, safe_sort_dir, oob=True),
+        table_panel(db_rows(safe_sort_by, safe_sort_dir), safe_sort_by, safe_sort_dir, oob=True),
     )
 
 
@@ -766,7 +953,10 @@ async def update(
     title: str | None = None,
     description: str | None = None,
     submitted_by: str | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
 ):
+    safe_sort_by, safe_sort_dir = normalize_sort(sort_by, sort_dir)
     photo_filename = None
     photo_buffer = None
     submitted_by = normalize_submitter_name(submitted_by)
@@ -786,10 +976,10 @@ async def update(
         photo_buffer,
     )
     if "hx-request" not in request.headers:
-        return RedirectResponse(url="/", status_code=303)
+        return RedirectResponse(url=build_index_url(safe_sort_by, safe_sort_dir), status_code=303)
     return Div(
-        form_panel(None, "", False, oob=True),
-        table_panel(db_rows(), oob=True),
+        form_panel(None, "", False, safe_sort_by, safe_sort_dir, oob=True),
+        table_panel(db_rows(safe_sort_by, safe_sort_dir), safe_sort_by, safe_sort_dir, oob=True),
     )
 
 

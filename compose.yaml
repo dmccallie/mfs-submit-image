@@ -1,11 +1,13 @@
 name: mfs-submit-image
 
 services:
-  app:
+  mfs-submit-image:
     build:
-      context: .
+      context: https://github.com/dmccallie/mfs-submit-image.git#master
       dockerfile: Dockerfile
     container_name: mfs-submit-image-app
+    image: dmccallie/mfs-submit-image:local-built
+    # port only used for external access outside docker (testing)
     ports:
       - "5001:5001"
     volumes:
@@ -20,4 +22,10 @@ services:
       # boto3 standard region variables, sourced from your existing key when needed.
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-${AWS_S3_REGION_NAME:-us-east-1}}
       AWS_REGION: ${AWS_REGION:-${AWS_S3_REGION_NAME:-us-east-1}}
+    networks:
+      - web
     restart: unless-stopped
+
+networks:
+  web:
+    external: true

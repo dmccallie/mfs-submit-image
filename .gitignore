@@ -22,3 +22,5 @@ wheels/
 *.jpeg
 *.png
 *.db
+
+*.sesskey

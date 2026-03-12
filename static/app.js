@@ -23,12 +23,15 @@ const setupDropzone = (root = document) => {
 
     if (titleInput && data.title) {
       titleInput.value = data.title;
+      titleInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
     if (descriptionInput && data.description) {
       descriptionInput.value = data.description;
+      descriptionInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
     if (submittedByInput && data.submitted_by) {
       submittedByInput.value = data.submitted_by;
+      submittedByInput.dispatchEvent(new Event('change', { bubbles: true }));
     }
   };
 
@@ -91,12 +94,58 @@ const setupDropzone = (root = document) => {
   });
 };
 
+const setupLogoutInterlock = (root = document) => {
+  const form = root.querySelector('#submission-form');
+  const logoutButton = root.querySelector('#logout-button');
+  if (!form || !logoutButton) return;
+  if (form.dataset.logoutGuardInitialized === 'true') return;
+  form.dataset.logoutGuardInitialized = 'true';
+
+  const trackedFields = Array.from(form.querySelectorAll('input, textarea, select')).filter((field) => {
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement || field instanceof HTMLSelectElement)) {
+      return false;
+    }
+    if (!field.name) return false;
+    if (field instanceof HTMLInputElement) {
+      return !['hidden', 'submit', 'button', 'reset'].includes(field.type);
+    }
+    return true;
+  });
+
+  const fieldValue = (field) => {
+    if (field instanceof HTMLInputElement) {
+      if (field.type === 'checkbox' || field.type === 'radio') {
+        return field.checked ? '1' : '0';
+      }
+      if (field.type === 'file') {
+        const files = Array.from(field.files || []);
+        return files.map((f) => `${f.name}:${f.size}`).join(',');
+      }
+    }
+    return field.value;
+  };
+
+  const snapshot = () => trackedFields.map((field, idx) => `${idx}=${fieldValue(field)}`).join('|');
+  const initialSnapshot = snapshot();
+
+  const refreshLogoutState = () => {
+    logoutButton.disabled = snapshot() !== initialSnapshot;
+  };
+
+  form.addEventListener('input', refreshLogoutState);
+  form.addEventListener('change', refreshLogoutState);
+  refreshLogoutState();
+};
+
 window.addEventListener('DOMContentLoaded', () => setupDropzone(document));
+window.addEventListener('DOMContentLoaded', () => setupLogoutInterlock(document));
 if (window.htmx) {
   htmx.onLoad((elt) => {
     setupDropzone(elt);
+    setupLogoutInterlock(elt);
   });
   document.body.addEventListener('htmx:historyRestore', () => {
     setupDropzone(document);
+    setupLogoutInterlock(document);
   });
 }
