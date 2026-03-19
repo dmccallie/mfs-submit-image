@@ -23,6 +23,9 @@ COPY static /app/static
 
 RUN mkdir -p /app/data/images
 
+ENV PORT=5001
 EXPOSE 5001
 
-CMD ["python", "main.py"]
+# CMD ["python", "main.py"]
+# run with uvicorn main:app --host
+CMD ["sh", "-c", "exec .venv/bin/uvicorn submit_image:app --host 0.0.0.0 --port ${PORT:-5001} --proxy-headers"]

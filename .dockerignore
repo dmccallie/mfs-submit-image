@@ -1,0 +1,49 @@
+# VCS
+.git
+.gitignore
+.github
+
+# Python cache / virtual envs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secrets
+
+# Local runtime data
+data/
+tmp/
+*.db
+*.sqlite
+*.sqlite3
+
+# jpgs from testing
+*.jpg
+*.jpeg
+
+# Tooling and editor files
+.vscode/
+.idea/
+.DS_Store
+
+# Build / logs
+build/
+dist/
+*.log
+
+# Tests and docs (not needed in runtime image)
+tests/

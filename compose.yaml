@@ -2,14 +2,14 @@ name: mfs-submit-image
 
 services:
   mfs-submit-image:
-    build:
-      context: https://github.com/dmccallie/mfs-submit-image.git#master
-      dockerfile: Dockerfile
-    container_name: mfs-submit-image-app
-    image: dmccallie/mfs-submit-image:local-built
+    # build:
+    #   context: https://github.com/dmccallie/mfs-submit-image.git#main
+    #   dockerfile: Dockerfile
+    image: ghcr.io/dmccallie/mfs-submit-image:latest
+    container_name: mfs-submit-image
     # port only used for external access outside docker (testing)
     ports:
-      - "5001:5001"
+      - "${PORT:-5001}:${PORT:-5001}"
     volumes:
       - ./data:/app/data
     env_file:

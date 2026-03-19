@@ -1001,5 +1001,6 @@ def image_by_id(image_id: int, v: str | None = None):
     except Exception:
         return RedirectResponse(url="/", status_code=302)
 
-
-serve()
+# will run with uvicorn submit_image:app --host in docker
+if __name__ == "__main__":
+    serve()

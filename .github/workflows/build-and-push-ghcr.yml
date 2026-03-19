@@ -1,0 +1,55 @@
+name: Build and Push to GHCR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fail on tracked secret-like files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t hits < <(
+            git ls-files \
+              | grep -Ei '(^|/)(\.env(\..+)?)$|\.(pem|key|crt|p12|pfx|secrets)$' \
+              | grep -Evi '(^|/)\.env\.sample$' \
+              || true
+          )
+
+          if (( ${#hits[@]} > 0 )); then
+            echo "Secret-like tracked files detected. Remove them from git before building images:"
+            printf ' - %s\n' "${hits[@]}"
+            exit 1
+          fi
+
+          echo "No tracked secret-like files detected."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push :latest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
